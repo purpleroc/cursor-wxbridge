@@ -384,7 +384,7 @@ function findSimilarModels(items: CursorModelInfo[], query: string, limit = 8): 
  * 将新的 model 值持久化到 bridge.config.json，保留其他字段不变。
  * 若文件不存在则新建。
  */
-function persistConfigModel(newModel: string): void {
+function persistConfigField(field: string, value: unknown): void {
   let raw: Record<string, unknown> = {};
   if (fs.existsSync(CONFIG_PATH)) {
     try {
@@ -394,7 +394,7 @@ function persistConfigModel(newModel: string): void {
       raw = {};
     }
   }
-  raw.model = newModel;
+  raw[field] = value;
   fs.writeFileSync(CONFIG_PATH, JSON.stringify(raw, null, 2) + '\n', 'utf-8');
 }
 
@@ -1165,16 +1165,15 @@ async function main() {
       await safeSend(credentials, userId, contextToken, [
         '命令：',
         '  /help          — 帮助',
+        '  /cwd           — 查看当前工作目录',
+        '  /cwd <路径>    — 切换工作目录（会重置会话）',
         '  /clear         — 清空会话 + 队列 + 追问',
         '  /stop          — 终止当前任务，继续队列',
         '  /stopall       — 终止当前任务 + 清空队列 + 追问',
         '  /send <路径>   — 发送服务器上的文件到微信',
         '  /model         — 查看当前模型及子命令',
-        '  /model list    — 列出 Cursor CLI 支持的全部模型（按家族分组）',
-        '  /model search <关键词>  — 模糊搜索模型',
-        '  /model <slug>  — 切换模型并写回 bridge.config.json（下一轮生效）',
-        '  /model clear   — 恢复 Cursor 默认模型',
-        '  /model refresh — 强制刷新模型列表缓存',
+        '  /model list    — 列出全部模型',
+        '  /model <slug>  — 切换模型',
         '',
         '直接发文字或图片，由 Cursor Agent 处理。',
         '忙时发送的消息默认作为**追问**，会在当前任务完成后融入同一对话上下文中处理。',
@@ -1249,7 +1248,7 @@ async function main() {
       if (arg === 'clear' || arg === 'default' || arg === 'reset') {
         cfg.model = '';
         try {
-          persistConfigModel('');
+          persistConfigField('model', '');
         } catch (e) {
           await safeSend(credentials, userId, contextToken,
             `⚠️ 内存已切换到 Cursor 默认，但写回配置失败：${(e as Error).message}`);
@@ -1290,7 +1289,7 @@ async function main() {
       const oldModel = cfg.model || '(默认)';
       cfg.model = slug;
       try {
-        persistConfigModel(slug);
+        persistConfigField('model', slug);
       } catch (e) {
         await safeSend(credentials, userId, contextToken,
           `⚠️ 内存已切换到 ${slug}，但写回 bridge.config.json 失败：${(e as Error).message}`);
@@ -1305,6 +1304,50 @@ async function main() {
       if (isBusy) {
         parts.push('当前有任务正在执行，若要立刻切换请先 /stop。');
       }
+      await safeSend(credentials, userId, contextToken, parts.join('\n'));
+      return;
+    }
+
+    if (text === '/cwd' || text.startsWith('/cwd ')) {
+      const arg = text.slice(4).trim();
+
+      if (!arg) {
+        await safeSend(credentials, userId, contextToken, `当前工作目录：${cfg.cwd}`);
+        return;
+      }
+
+      const abs = path.isAbsolute(arg) ? arg : path.resolve(cfg.cwd, arg);
+      if (!fs.existsSync(abs)) {
+        await safeSend(credentials, userId, contextToken, `❌ 目录不存在：${abs}`);
+        return;
+      }
+      const stat = fs.statSync(abs);
+      if (!stat.isDirectory()) {
+        await safeSend(credentials, userId, contextToken, `❌ 不是目录：${abs}`);
+        return;
+      }
+
+      const oldCwd = cfg.cwd;
+      cfg.cwd = abs;
+      try {
+        persistConfigField('cwd', abs);
+      } catch (e) {
+        await safeSend(credentials, userId, contextToken,
+          `⚠️ 内存已切换，但写回配置失败：${(e as Error).message}`);
+        return;
+      }
+
+      if (isBusy) {
+        killAgent(ctx);
+      }
+      ctx.queue.length = 0;
+      ctx.followUpBuffer.length = 0;
+      clearFollowUpFile(userId, oldCwd);
+      delete state.sessions[userId];
+      saveState(state);
+
+      const parts = [`✅ 工作目录已切换：\n${oldCwd}\n→ ${abs}`, '已写回 bridge.config.json，会话已重置。'];
+      if (isBusy) parts.push('正在执行的任务已终止。');
       await safeSend(credentials, userId, contextToken, parts.join('\n'));
       return;
     }
