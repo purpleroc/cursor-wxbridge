@@ -1,0 +1,21 @@
+{
+  "cwd": "",
+  "agentPath": "agent",
+  "model": "claude-4.6-opus-high",
+  "force": true,
+  "agentTimeoutMs": 1800000,
+  "maxMessageLength": 4000,
+  "enableSession": true,
+  "sessionTimeoutMs": 1800000,
+  "sendThinkingHint": true,
+  "thinkingHintText": "✅ 已收到，正在处理...",
+  "showToolCalls": true,
+  "verbose": false,
+  "showTokenUsage": true,
+  "dangerousCommandPatterns": ["\\brm\\b", "\\brmdir\\b", "\\bsudo\\b"],
+  "dangerousCommandTimeoutMs": 120000,
+  "criticalCommandPatterns": ["\\brm\\s+-r[f ].*\\/", "\\bsudo\\s+rm\\b", "\\bmkfs\\b", "\\bdd\\s+if="],
+  "allowedUserIds": [],
+  "replyAllowedUserIds": [],
+  "replyDeniedMessage": "⚠️ 您没有查看回复的权限。请联系管理员将您的 ID 加入白名单。"
+}

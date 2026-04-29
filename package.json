@@ -1,0 +1,20 @@
+{
+  "name": "wechat-cursor-agent-bridge",
+  "version": "1.0.0",
+  "ilink_appid": "bot",
+  "description": "微信 ClawBot ↔ Claude Agent SDK 桥接（对齐 Cursor 工具/权限），支持图文文件与微信侧权限数字确认",
+  "type": "module",
+  "scripts": {
+    "setup": "tsx src/setup.ts",
+    "start": "tsx src/bridge.ts",
+    "dev": "tsx watch src/bridge.ts"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}

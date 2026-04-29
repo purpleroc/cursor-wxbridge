@@ -1,0 +1,9 @@
+credentials.json
+bridge.config.json
+bridge-state.json
+node_modules/
+dist/
+.media_cache/
+wx.log
+credentials.json
+DEV_GUIDE.md
