@@ -4,6 +4,8 @@
 
 > **致谢**：项目功能来自 [wechat_agent_bridge_skills](https://github.com/kaixindelele/wechat_agent_bridge_skills)。本项目只是抽离了 wxbridge 部分，并在交互体验上做了一些优化。
 
+> **企业微信版**：如果你想用**企业微信智能机器人**（而非个人微信）对接 Cursor Agent，请切换到 [`cursor-wecom-bridge`](../../tree/cursor-wecom-bridge) 分支。该分支基于企业微信智能机器人 WebSocket 长连接实现，无需扫码登录，配置 `botId` / `secret` 即可使用。
+
 ## 本项目在原版基础上的优化
 
 - **追问融入**：Agent 忙时发送的消息自动进入追问缓冲区，任务完成后通过 `--resume` 在同一会话上下文中处理，无需重复发起
