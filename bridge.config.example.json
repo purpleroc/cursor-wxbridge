@@ -9,6 +9,7 @@
   "sessionTimeoutMs": 1800000,
   "sendThinkingHint": true,
   "thinkingHintText": "✅ 已收到，正在处理...",
+  "welcomeText": "👋 我是 Cursor Agent 助手，直接发消息即可让我在服务器上帮你处理任务。发送 /help 查看命令。",
   "showToolCalls": true,
   "verbose": false,
   "showTokenUsage": true,

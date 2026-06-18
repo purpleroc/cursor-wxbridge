@@ -1,6 +1,6 @@
 /**
  * 桥接配置（bridge.config.json + 默认值）
- * 已从 @anthropic-ai/claude-agent-sdk 迁移到 Cursor CLI（agent 命令）
+ * 企业微信智能机器人 ↔ Cursor CLI（agent 命令）
  */
 
 import * as fs from 'node:fs';
@@ -33,6 +33,8 @@ export interface BridgeConfig {
   thinkingHintText: string;
   showToolCalls: boolean;
   verbose: boolean;
+  /** 用户当天首次进入会话（enter_chat 事件）时发送的欢迎语，留空则不发送 */
+  welcomeText: string;
   /** 是否在最终回答末尾附加 token 消耗统计（input/output/cache） */
   showTokenUsage: boolean;
 
@@ -67,6 +69,7 @@ export const defaultConfig: BridgeConfig = {
   thinkingHintText: '✅ 已收到，正在处理...',
   showToolCalls: false,
   verbose: false,
+  welcomeText: '👋 我是 Cursor Agent 助手，直接发消息即可让我在服务器上帮你处理任务。发送 /help 查看命令。',
   showTokenUsage: true,
 
   dangerousCommandPatterns: ['\\brm\\b', '\\brmdir\\b', '\\bsudo\\b'],

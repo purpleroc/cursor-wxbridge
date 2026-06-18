@@ -1,10 +1,13 @@
 /**
- * 微信 ilink 长轮询 + Cursor CLI agent（headless），微信收发消息。
+ * 企业微信智能机器人 ↔ Cursor CLI agent（headless）桥接。
  *
- * 策略：每轮 agent 最多发 3 条消息（thinkingHint + 思考过程 + 最终回答），
- * 避免触发 ilink 的 context_token 消息条数限制（约9条 ret=-2）。
- * showToolCalls 开启时，完成后发送格式化的思考过程摘要到微信端，
- * 方便检查意图识别和推理链路。
+ * 通道：基于 @wecom/aibot-node-sdk 的 WebSocket 长连接，事件驱动收消息。
+ * 回复策略（混合）：
+ *   - 收到消息后用被动流式 replyStream 立即回执"处理中"（即时反馈）
+ *   - 中间进度 / 最终回答统一用主动推送 sendMessage(userid) 送达
+ *     （Cursor agent 任务常需数分钟~数十分钟，远超被动回复时效窗口）
+ *
+ * 仅支持单聊，会话 key = userid。
  *
  * 支持：
  *   - 追问融入：agent 忙时新消息默认进追问缓冲区，当前任务完成后
@@ -21,13 +24,14 @@ import { spawn, execSync, execFile, type ChildProcess } from 'node:child_process
 import { promisify } from 'node:util';
 import * as readline from 'node:readline';
 
+import type { WsFrame, BaseMessage, EnterChatEvent, EventMessageWith } from '@wecom/aibot-node-sdk';
+
 import { loadBridgeConfig, TEMPLATES_ROOT, CONFIG_PATH } from './config.js';
-import { getUpdates, sendMessage, sendFile } from './ilink.js';
-import type { Credentials, WeixinMessage } from './types.js';
-import { materializeInboundMessage, type InboundPayload } from './inbound-media.js';
+import { loadCredentials } from './credentials.js';
+import { createWecomClient, pushMarkdown, replyAck, sendFileToUser } from './wecom.js';
+import { materializeInbound, type InboundPayload } from './inbound.js';
 import { PermissionGate } from './permission-gate.js';
 
-const CREDENTIALS_PATH = path.join(TEMPLATES_ROOT, 'credentials.json');
 const STATE_PATH = path.join(TEMPLATES_ROOT, 'bridge-state.json');
 const INBOUND_DIR = path.join(TEMPLATES_ROOT, '.media_cache', 'inbound');
 const FOLLOWUP_DIR = path.join(TEMPLATES_ROOT, '.media_cache', 'followups');
@@ -37,18 +41,18 @@ const MAX_QUEUE_SIZE = 10;
 /* ---------- state persistence ---------- */
 
 interface BridgeState {
-  get_updates_buf: string;
   sessions: Record<string, { sessionId: string; lastActivity: number }>;
 }
 
 function loadState(): BridgeState {
   if (!fs.existsSync(STATE_PATH)) {
-    return { get_updates_buf: '', sessions: {} };
+    return { sessions: {} };
   }
   try {
-    return JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8')) as BridgeState;
+    const raw = JSON.parse(fs.readFileSync(STATE_PATH, 'utf-8')) as Partial<BridgeState>;
+    return { sessions: raw.sessions ?? {} };
   } catch {
-    return { get_updates_buf: '', sessions: {} };
+    return { sessions: {} };
   }
 }
 
@@ -56,46 +60,7 @@ function saveState(s: BridgeState) {
   fs.writeFileSync(STATE_PATH, JSON.stringify(s, null, 2), 'utf-8');
 }
 
-function loadCredentials(): Credentials {
-  if (!fs.existsSync(CREDENTIALS_PATH)) {
-    throw new Error(`缺少 ${CREDENTIALS_PATH}，请先 npm run setup`);
-  }
-  return JSON.parse(fs.readFileSync(CREDENTIALS_PATH, 'utf-8')) as Credentials;
-}
-
 /* ---------- helpers ---------- */
-
-async function safeSend(
-  cred: Credentials, userId: string, token: string, text: string,
-): Promise<boolean> {
-  try {
-    const resp = await sendMessage(cred, userId, token, text) as { ret?: number; errmsg?: string };
-    if (resp.ret !== undefined && resp.ret !== 0) {
-      console.error(`[bridge] ⚠ sendMessage ret=${resp.ret} errmsg=${resp.errmsg ?? ''}`);
-      return false;
-    }
-    return true;
-  } catch (e) {
-    console.error(`[bridge] ❌ sendMessage error:`, e);
-    return false;
-  }
-}
-
-async function safeSendLong(
-  cred: Credentials, userId: string, token: string, text: string, maxLen: number,
-): Promise<boolean> {
-  const t = text || '';
-  if (!t) return false;
-  for (let i = 0; i < t.length; i += maxLen) {
-    const ok = await safeSend(cred, userId, token, t.slice(i, i + maxLen));
-    if (!ok) return false;
-  }
-  return true;
-}
-
-function sleep(ms: number) {
-  return new Promise(r => setTimeout(r, ms));
-}
 
 function formatTokenCount(n: number | undefined): string {
   const v = n ?? 0;
@@ -217,8 +182,6 @@ function formatUSD(v: number): string {
 
 /**
  * 按 Cursor 官方 API 费率计算本次请求的美金成本。
- * - 缓存价：未提供 cacheRead/cacheWrite 时按 input 价兜底
- * - Max Mode upcharge：Cursor 个人计划在模型 API 费率上额外 +20%；仅对 `maxModeRequired` 的模型展示
  */
 function calcCost(usage: AgentUsage, pricing: ModelPricing): { base: number; withMax: number } {
   const inTok = usage.inputTokens ?? 0;
@@ -381,8 +344,7 @@ function findSimilarModels(items: CursorModelInfo[], query: string, limit = 8): 
 }
 
 /**
- * 将新的 model 值持久化到 bridge.config.json，保留其他字段不变。
- * 若文件不存在则新建。
+ * 将新的配置字段持久化到 bridge.config.json，保留其他字段不变。
  */
 function persistConfigField(field: string, value: unknown): void {
   let raw: Record<string, unknown> = {};
@@ -400,8 +362,6 @@ function persistConfigField(field: string, value: unknown): void {
 
 /**
  * 递归终止指定进程的所有子进程（不杀父进程本身）。
- * 用于"跳过当前工具调用"：杀掉正在执行的 shell 子进程，
- * 然后 SIGCONT 恢复 agent 主进程，使其收到工具失败并继续后续工作。
  */
 function killChildProcesses(parentPid: number): number {
   try {
@@ -428,12 +388,10 @@ function killChildProcesses(parentPid: number): number {
 
 interface PendingMsg {
   prompt: string;
-  contextToken: string;
 }
 
 interface UserContext {
   proc: ChildProcess | null;
-  contextToken: string;
   queue: PendingMsg[];
   followUpBuffer: PendingMsg[];
   killed: boolean;
@@ -579,12 +537,12 @@ function formatThinkingProcess(log: ThinkingEntry[], toolCount: number, maxLen: 
 const FOLLOWUP_FILENAME = '.bridge-followup.md';
 
 const BRIDGE_CAPABILITY_HINT = [
-  '[系统提示：你正通过微信桥接与用户对话。',
-  '当用户要求发送文件/图片/音频/视频时，在回复中使用 [SEND_FILE:/绝对路径] 标记，桥接会自动上传发送到用户微信。',
+  '[系统提示：你正通过企业微信桥接与用户对话。',
+  '当用户要求发送文件/图片/音频/视频时，在回复中使用 [SEND_FILE:/绝对路径] 标记，桥接会自动上传发送到用户企业微信。',
   '路径必须是服务器上已存在的绝对路径，单文件不超过25MB。',
   '示例：这是生成的音频 [SEND_FILE:/tmp/output/chapter_01.mp3]',
   '',
-  '重要：用户可能在你执行任务期间通过微信发来追问或补充信息。',
+  '重要：用户可能在你执行任务期间通过企业微信发来追问或补充信息。',
   `这些追问会实时写入工作区根目录的 ${FOLLOWUP_FILENAME} 文件。`,
   '在你做出重要决策（如选择安装源、确定技术方案、开始长时间操作）之前，',
   `请先用 Read 工具检查 ${FOLLOWUP_FILENAME} 是否存在且有内容，以获取用户最新的指示。]`,
@@ -681,14 +639,34 @@ async function main() {
   const credentials = loadCredentials();
   const state = loadState();
   const userContexts = new Map<string, UserContext>();
+  const client = createWecomClient(credentials, cfg.verbose);
 
-  function getOrCreateCtx(userId: string, contextToken: string): UserContext {
+  /** 去重：缓存最近处理过的 msgid，避免 SDK 重投递导致重复处理 */
+  const seenMsgIds = new Set<string>();
+  function markSeen(msgid: string): boolean {
+    if (!msgid) return false;
+    if (seenMsgIds.has(msgid)) return true;
+    seenMsgIds.add(msgid);
+    if (seenMsgIds.size > 2000) {
+      // 简单清理：清空一半（Set 无序，直接重建）
+      const arr = [...seenMsgIds].slice(-1000);
+      seenMsgIds.clear();
+      for (const id of arr) seenMsgIds.add(id);
+    }
+    return false;
+  }
+
+  /** 主动推送文本到用户（异步产出的进度 / 最终回答） */
+  async function push(userId: string, text: string): Promise<boolean> {
+    return pushMarkdown(client, userId, text, cfg.maxMessageLength);
+  }
+
+  function getOrCreateCtx(userId: string): UserContext {
     let ctx = userContexts.get(userId);
     if (!ctx) {
-      ctx = { proc: null, contextToken, queue: [], followUpBuffer: [], killed: false };
+      ctx = { proc: null, queue: [], followUpBuffer: [], killed: false };
       userContexts.set(userId, ctx);
     }
-    ctx.contextToken = contextToken;
     return ctx;
   }
 
@@ -713,10 +691,9 @@ async function main() {
   async function runAgentCli(
     prompt: string,
     userId: string,
-    contextToken: string,
     resumeSessionId?: string,
   ): Promise<string | undefined> {
-    const ctx = getOrCreateCtx(userId, contextToken);
+    const ctx = getOrCreateCtx(userId);
 
     const args = ['-p', '--output-format', 'stream-json', '--workspace', cfg.cwd, '--trust'];
     if (cfg.force) args.push('--force');
@@ -756,13 +733,13 @@ async function main() {
 
       if (cfg.showToolCalls && thinkingLog.length > 0) {
         const processText = formatThinkingProcess(thinkingLog, toolCount, cfg.maxMessageLength);
-        await safeSend(credentials, userId, contextToken, processText);
+        await push(userId, processText);
       }
       const partial = chooseAssistantReply(lastAssistantText, bestAssistantText, '');
       const notice = partial
         ? `⏰ Agent 运行超过 ${elapsed} 分钟，已自动终止。以下是已完成的部分结果：\n\n${partial}`
         : `⏰ Agent 运行超过 ${elapsed} 分钟，已自动终止。暂无可返回的结果。\n发 /stop 终止后可重新发起更小的任务。`;
-      await safeSendLong(credentials, userId, contextToken, notice, cfg.maxMessageLength);
+      await push(userId, notice);
 
       proc.kill('SIGTERM');
       setTimeout(() => { if (!proc.killed) proc.kill('SIGKILL'); }, 5000);
@@ -860,7 +837,7 @@ async function main() {
                   '',
                   `（${timeoutSec} 秒内无回复将自动${isCritical ? '终止' : '跳过'}）`,
                 ];
-                await sendMessage(credentials, userId, contextToken, promptLines.join('\n'));
+                await push(userId, promptLines.join('\n'));
 
                 const ac = new AbortController();
                 const onProcExit = () => ac.abort();
@@ -871,14 +848,14 @@ async function main() {
 
                   if (result.behavior === 'allow') {
                     console.log('[bridge] ✅ 用户允许');
-                    await sendMessage(credentials, userId, contextToken, '✅ 已允许，继续执行。');
+                    await push(userId, '✅ 已允许，继续执行。');
                     try { process.kill(-proc.pid!, 'SIGCONT'); } catch {}
                   } else if (isCritical) {
                     console.log(`[bridge] ❌ 关键操作被拒绝，终止 agent${result.userText ? ` (用户指示: ${result.userText})` : ''}`);
-                    await sendMessage(credentials, userId, contextToken,
+                    await push(userId,
                       `❌ 已拒绝关键操作，终止当前 agent。${result.userText ? `\n📝 你的指示已记录: "${result.userText}"` : ''}`);
                     if (result.userText) {
-                      ctx.followUpBuffer.push({ prompt: `[用户在拒绝操作 \`${dangerDesc.slice(0, 200)}\` 时附加的指示] ${result.userText}`, contextToken });
+                      ctx.followUpBuffer.push({ prompt: `[用户在拒绝操作 \`${dangerDesc.slice(0, 200)}\` 时附加的指示] ${result.userText}` });
                       writeFollowUpFile(userId, ctx.followUpBuffer, cfg.cwd);
                     }
                     ctx.killed = true;
@@ -891,10 +868,10 @@ async function main() {
                     const skipMsg = result.userText
                       ? `⏭ 已跳过此操作，agent 继续运行。\n📝 你的指示已传达: "${result.userText}"`
                       : '⏭ 已跳过此操作，agent 继续运行。';
-                    await sendMessage(credentials, userId, contextToken, skipMsg);
+                    await push(userId, skipMsg);
 
                     if (result.userText) {
-                      ctx.followUpBuffer.push({ prompt: `[用户在跳过操作 \`${dangerDesc.slice(0, 200)}\` 时的指示] ${result.userText}`, contextToken });
+                      ctx.followUpBuffer.push({ prompt: `[用户在跳过操作 \`${dangerDesc.slice(0, 200)}\` 时的指示] ${result.userText}` });
                       writeFollowUpFile(userId, ctx.followUpBuffer, cfg.cwd);
                     }
                   }
@@ -922,7 +899,7 @@ async function main() {
             if (cfg.showToolCalls && thinkingLog.length > 0) {
               const processText = formatThinkingProcess(thinkingLog, toolCount, cfg.maxMessageLength);
               console.log(`[bridge] 📨 发送思考过程 (${processText.length} 字符)…`);
-              await safeSend(credentials, userId, contextToken, processText);
+              await push(userId, processText);
             }
 
             let finalText = chooseAssistantReply(
@@ -931,18 +908,18 @@ async function main() {
               (res.result ?? '').trim(),
             );
             if (finalText) {
-              const cleaned = await extractAndSendFiles(finalText, userId, contextToken);
+              const cleaned = await extractAndSendFiles(finalText, userId);
               const footer = cfg.showTokenUsage ? buildUsageFooter(usage, res.duration_ms, agentModel) : '';
               const toSend = cleaned.trim() ? cleaned + footer : footer.trim();
               if (toSend) {
                 console.log(`[bridge] 📨 发送最终回答 (${toSend.length} 字符)…`);
-                const ok = await safeSendLong(credentials, userId, contextToken, toSend, cfg.maxMessageLength);
+                const ok = await push(userId, toSend);
                 console.log(`[bridge] ${ok ? '✅ 最终回答发送成功' : '⚠ 最终回答发送失败'}`);
               }
             } else if (cfg.showTokenUsage && usage) {
               const footer = buildUsageFooter(usage, res.duration_ms, agentModel).trim();
               if (footer) {
-                await safeSend(credentials, userId, contextToken, footer);
+                await push(userId, footer);
               }
             }
           } else {
@@ -950,10 +927,9 @@ async function main() {
             console.log(`[agent] ❌ ${res.subtype}: ${errText.slice(0, 200)}`);
             if (cfg.showToolCalls && thinkingLog.length > 0) {
               const processText = formatThinkingProcess(thinkingLog, toolCount, cfg.maxMessageLength);
-              await safeSend(credentials, userId, contextToken, processText);
+              await push(userId, processText);
             }
-            await safeSend(credentials, userId, contextToken,
-              `❌ ${errText}`.slice(0, cfg.maxMessageLength));
+            await push(userId, `❌ ${errText}`.slice(0, cfg.maxMessageLength));
           }
         }
       }
@@ -965,8 +941,7 @@ async function main() {
 
       if (proc.exitCode !== null && proc.exitCode !== 0 && !timedOut && !ctx.killed) {
         console.error(`[agent] ⚠ 退出码=${proc.exitCode} stderr=${stderr.slice(0, 500)}`);
-        await safeSend(credentials, userId, contextToken,
-          `❌ Agent 异常退出 (code=${proc.exitCode}): ${stderr.slice(0, 400)}`);
+        await push(userId, `❌ Agent 异常退出 (code=${proc.exitCode}): ${stderr.slice(0, 400)}`);
       }
     } finally {
       clearTimeout(timeout);
@@ -982,7 +957,7 @@ async function main() {
 
   /* ---------- process one task ---------- */
 
-  async function processTask(userId: string, prompt: string, contextToken: string) {
+  async function processTask(userId: string, prompt: string) {
     const sessionRec = state.sessions[userId];
     const resume =
       cfg.enableSession &&
@@ -991,7 +966,7 @@ async function main() {
         ? sessionRec.sessionId
         : undefined;
 
-    const newSessionId = await runAgentCli(prompt, userId, contextToken, resume);
+    const newSessionId = await runAgentCli(prompt, userId, resume);
 
     if (newSessionId) {
       state.sessions[userId] = { sessionId: newSessionId, lastActivity: Date.now() };
@@ -1001,17 +976,14 @@ async function main() {
 
   /* ---------- drain queue ---------- */
 
-  async function drainQueue(userId: string, firstPrompt: string, firstToken: string) {
-    const ctx = getOrCreateCtx(userId, firstToken);
+  async function drainQueue(userId: string, firstPrompt: string) {
+    const ctx = getOrCreateCtx(userId);
 
     try {
-      if (cfg.sendThinkingHint) {
-        await safeSend(credentials, userId, firstToken, cfg.thinkingHintText);
-      }
-      await processTask(userId, firstPrompt, firstToken);
+      await processTask(userId, firstPrompt);
     } catch (e) {
       console.error('[bridge] processTask error:', e);
-      await safeSend(credentials, userId, firstToken, `❌ 处理出错: ${String(e).slice(0, 500)}`);
+      await push(userId, `❌ 处理出错: ${String(e).slice(0, 500)}`);
     }
 
     /* --- process follow-up buffer: resume same session with accumulated context --- */
@@ -1023,12 +995,12 @@ async function main() {
       console.log(`[bridge] 📋 处理队列消息 (user=${userId.slice(0, 12)}…, 剩余${ctx.queue.length}条)`);
 
       try {
-        await safeSend(credentials, userId, next.contextToken,
+        await push(userId,
           `📋 开始处理排队消息: "${next.prompt.slice(0, 50)}${next.prompt.length > 50 ? '…' : ''}"`);
-        await processTask(userId, next.prompt, next.contextToken);
+        await processTask(userId, next.prompt);
       } catch (e) {
         console.error('[bridge] queue processTask error:', e);
-        await safeSend(credentials, userId, next.contextToken, `❌ 处理出错: ${String(e).slice(0, 500)}`);
+        await push(userId, `❌ 处理出错: ${String(e).slice(0, 500)}`);
       }
 
       await drainFollowUps(userId, ctx);
@@ -1041,7 +1013,6 @@ async function main() {
     if (ctx.followUpBuffer.length === 0) return;
 
     const followUps = ctx.followUpBuffer.splice(0);
-    const lastToken = followUps[followUps.length - 1].contextToken;
     clearFollowUpFile(userId, cfg.cwd);
 
     const count = followUps.length;
@@ -1049,12 +1020,11 @@ async function main() {
 
     const followUpPrompt = buildFollowUpPrompt(followUps);
     try {
-      await safeSend(credentials, userId, lastToken,
-        `💬 开始处理 ${count} 条追问，续接同一对话上下文…`);
-      await processTask(userId, followUpPrompt, lastToken);
+      await push(userId, `💬 开始处理 ${count} 条追问，续接同一对话上下文…`);
+      await processTask(userId, followUpPrompt);
     } catch (e) {
       console.error('[bridge] follow-up processTask error:', e);
-      await safeSend(credentials, userId, lastToken, `❌ 处理追问出错: ${String(e).slice(0, 500)}`);
+      await push(userId, `❌ 处理追问出错: ${String(e).slice(0, 500)}`);
     }
 
     if (ctx.followUpBuffer.length > 0) {
@@ -1082,13 +1052,13 @@ async function main() {
 
   const SEND_FILE_RE = /\[SEND_FILE:([^\]]+)\]/g;
 
-  async function extractAndSendFiles(text: string, userId: string, contextToken: string): Promise<string> {
+  async function extractAndSendFiles(text: string, userId: string): Promise<string> {
     const matches = [...text.matchAll(SEND_FILE_RE)];
     if (!matches.length) return text;
     for (const m of matches) {
       const fp = m[1].trim();
       console.log(`[bridge] 📤 agent 请求发送文件: ${fp}`);
-      await handleSendFile(userId, contextToken, fp);
+      await handleSendFile(userId, fp);
     }
     return text.replace(SEND_FILE_RE, '').trim();
   }
@@ -1097,50 +1067,62 @@ async function main() {
 
   const MAX_FILE_SIZE = 25 * 1024 * 1024;
 
-  async function handleSendFile(userId: string, contextToken: string, filePath: string) {
+  async function handleSendFile(userId: string, filePath: string) {
     if (!filePath) {
-      await sendMessage(credentials, userId, contextToken, '用法：/send <文件路径>');
+      await push(userId, '用法：/send <文件路径>');
       return;
     }
     const resolved = path.isAbsolute(filePath) ? filePath : path.resolve(cfg.cwd, filePath);
     if (!fs.existsSync(resolved)) {
-      await sendMessage(credentials, userId, contextToken, `❌ 文件不存在: ${resolved}`);
+      await push(userId, `❌ 文件不存在: ${resolved}`);
       return;
     }
     const stat = fs.statSync(resolved);
     if (!stat.isFile()) {
-      await sendMessage(credentials, userId, contextToken, `❌ 不是文件（可能是目录）: ${resolved}`);
+      await push(userId, `❌ 不是文件（可能是目录）: ${resolved}`);
       return;
     }
     if (stat.size > MAX_FILE_SIZE) {
-      await sendMessage(credentials, userId, contextToken,
-        `❌ 文件过大 (${(stat.size / 1024 / 1024).toFixed(1)}MB)，微信限制约 25MB。`);
+      await push(userId, `❌ 文件过大 (${(stat.size / 1024 / 1024).toFixed(1)}MB)，企业微信限制约 25MB。`);
       return;
     }
     try {
       console.log(`[bridge] 📤 发送文件: ${resolved} (${(stat.size / 1024).toFixed(0)}KB)`);
-      await sendFile(credentials, userId, contextToken, resolved);
+      await sendFileToUser(client, userId, resolved);
       console.log(`[bridge] ✅ 文件发送成功: ${resolved}`);
     } catch (e) {
       console.error('[bridge] sendFile error:', e);
-      await sendMessage(credentials, userId, contextToken,
-        `❌ 文件发送失败: ${String(e).slice(0, 300)}`);
+      await push(userId, `❌ 文件发送失败: ${String(e).slice(0, 300)}`);
     }
   }
 
   /* ---------- per-message handler ---------- */
 
-  async function handleOneMessage(msg: WeixinMessage) {
-    if (msg.message_type !== 1) return;
-    const userId = msg.from_user_id;
-    const contextToken = msg.context_token;
-    if (!userId || !contextToken) return;
+  async function handleOneMessage(frame: WsFrame<BaseMessage>) {
+    const body = frame.body;
+    if (!body) return;
+    const userId = body.from?.userid;
+    if (!userId) return;
+
+    // 仅支持单聊
+    if (body.chattype && body.chattype !== 'single') {
+      console.log(`[bridge] 跳过非单聊消息 chattype=${body.chattype}`);
+      return;
+    }
+
+    if (markSeen(body.msgid)) {
+      console.log(`[bridge] 跳过重复消息 msgid=${body.msgid}`);
+      return;
+    }
 
     if (cfg.allowedUserIds.length && !cfg.allowedUserIds.includes(userId)) {
       return;
     }
 
-    const inbound = await materializeInboundMessage(msg, credentials, INBOUND_DIR);
+    /** 被动即时回执（每条入站消息至多调用一次） */
+    const ack = (text: string) => replyAck(client, frame, text);
+
+    const inbound = await materializeInbound(client, body, INBOUND_DIR);
     const text = inbound.text.trim();
 
     console.log(`[bridge] 📩 收到消息 user=${userId.slice(0, 12)}… text="${text.slice(0, 60)}" images=${inbound.imageParts.length} files=${inbound.savedPaths.length}`);
@@ -1149,20 +1131,22 @@ async function main() {
       return;
     }
 
-    const ctx = getOrCreateCtx(userId, contextToken);
+    const ctx = getOrCreateCtx(userId);
     const isBusy = ctx.proc !== null;
 
+    /* --- pending permission reply --- */
     if (gate.hasPending(userId)) {
-      const notifyInvalid = async (hint: string) => { await sendMessage(credentials, userId, contextToken, hint); };
+      const notifyInvalid = async (hint: string) => { await ack(hint); };
       if (gate.deliver(userId, text, notifyInvalid)) {
+        await ack('✅ 已收到你的回复');
         return;
       }
     }
 
-    /* --- commands --- */
+    /* --- commands (synchronous reply via passive ack) --- */
 
     if (text === '/help') {
-      await safeSend(credentials, userId, contextToken, [
+      await ack([
         '命令：',
         '  /help          — 帮助',
         '  /cwd           — 查看当前工作目录',
@@ -1170,7 +1154,7 @@ async function main() {
         '  /clear         — 清空会话 + 队列 + 追问',
         '  /stop          — 终止当前任务，继续队列',
         '  /stopall       — 终止当前任务 + 清空队列 + 追问',
-        '  /send <路径>   — 发送服务器上的文件到微信',
+        '  /send <路径>   — 发送服务器上的文件到企业微信',
         '  /model         — 查看当前模型及子命令',
         '  /model list    — 列出全部模型',
         '  /model <slug>  — 切换模型',
@@ -1190,7 +1174,7 @@ async function main() {
       const arg = text.slice(6).trim();
 
       if (!arg) {
-        await safeSend(credentials, userId, contextToken, [
+        await ack([
           `当前模型：${cfg.model || '(Cursor 默认)'}`,
           '',
           '子命令：',
@@ -1207,7 +1191,7 @@ async function main() {
       if (arg === 'refresh') {
         modelCache = null;
         const items = await fetchCursorModels(cfg.agentPath, true);
-        await safeSend(credentials, userId, contextToken,
+        await ack(
           items.length
             ? `✅ 已刷新，共 ${items.length} 个模型。用 /model list 查看。`
             : '⚠️ 刷新失败：未拿到模型列表，请检查 agent CLI 登录状态。');
@@ -1217,31 +1201,30 @@ async function main() {
       if (arg === 'list' || arg === 'ls') {
         const items = await fetchCursorModels(cfg.agentPath);
         if (!items.length) {
-          await safeSend(credentials, userId, contextToken,
-            '⚠️ 无法获取模型列表。可能原因：agent 未登录 / 网络问题 / agentPath 配置错误。');
+          await ack('⚠️ 无法获取模型列表。可能原因：agent 未登录 / 网络问题 / agentPath 配置错误。');
           return;
         }
-        const body = formatModelsList(items, cfg.model);
+        const body2 = formatModelsList(items, cfg.model);
         const header = `Cursor CLI 可用模型（共 ${items.length} 个，当前：${cfg.model || '(默认)'}）\n\n`;
-        await safeSendLong(credentials, userId, contextToken, header + body, cfg.maxMessageLength);
+        await ack(header + body2);
         return;
       }
 
       if (arg.startsWith('search ')) {
         const kw = arg.slice(7).trim();
         if (!kw) {
-          await safeSend(credentials, userId, contextToken, '用法：/model search <关键词>');
+          await ack('用法：/model search <关键词>');
           return;
         }
         const items = await fetchCursorModels(cfg.agentPath);
         const hits = findSimilarModels(items, kw, 20);
         if (!hits.length) {
-          await safeSend(credentials, userId, contextToken, `未匹配到包含 "${kw}" 的模型。`);
+          await ack(`未匹配到包含 "${kw}" 的模型。`);
           return;
         }
-        const body = formatModelsList(hits, cfg.model);
+        const body2 = formatModelsList(hits, cfg.model);
         const header = `搜索 "${kw}"，共 ${hits.length} 个匹配：\n\n`;
-        await safeSendLong(credentials, userId, contextToken, header + body, cfg.maxMessageLength);
+        await ack(header + body2);
         return;
       }
 
@@ -1250,12 +1233,10 @@ async function main() {
         try {
           persistConfigField('model', '');
         } catch (e) {
-          await safeSend(credentials, userId, contextToken,
-            `⚠️ 内存已切换到 Cursor 默认，但写回配置失败：${(e as Error).message}`);
+          await ack(`⚠️ 内存已切换到 Cursor 默认，但写回配置失败：${(e as Error).message}`);
           return;
         }
-        await safeSend(credentials, userId, contextToken,
-          '✅ 已恢复 Cursor 默认模型，并写回 bridge.config.json。下一轮对话生效。');
+        await ack('✅ 已恢复 Cursor 默认模型，并写回 bridge.config.json。下一轮对话生效。');
         return;
       }
 
@@ -1264,8 +1245,7 @@ async function main() {
       const force = !!forceMatch;
 
       if (/\s/.test(slug)) {
-        await safeSend(credentials, userId, contextToken,
-          '⚠️ 模型 slug 不应含空格。用法：/model <slug>');
+        await ack('⚠️ 模型 slug 不应含空格。用法：/model <slug>');
         return;
       }
 
@@ -1277,7 +1257,7 @@ async function main() {
         const hint = similar.length
           ? '相近的候选：\n' + similar.map(m => `  ${m.slug} — ${m.display}`).join('\n')
           : '（未找到相近候选，用 /model list 查看全部）';
-        await safeSend(credentials, userId, contextToken, [
+        await ack([
           `⚠️ 模型 "${slug}" 不在当前账号可用列表中。`,
           hint,
           '',
@@ -1291,8 +1271,7 @@ async function main() {
       try {
         persistConfigField('model', slug);
       } catch (e) {
-        await safeSend(credentials, userId, contextToken,
-          `⚠️ 内存已切换到 ${slug}，但写回 bridge.config.json 失败：${(e as Error).message}`);
+        await ack(`⚠️ 内存已切换到 ${slug}，但写回 bridge.config.json 失败：${(e as Error).message}`);
         return;
       }
 
@@ -1304,7 +1283,7 @@ async function main() {
       if (isBusy) {
         parts.push('当前有任务正在执行，若要立刻切换请先 /stop。');
       }
-      await safeSend(credentials, userId, contextToken, parts.join('\n'));
+      await ack(parts.join('\n'));
       return;
     }
 
@@ -1312,18 +1291,18 @@ async function main() {
       const arg = text.slice(4).trim();
 
       if (!arg) {
-        await safeSend(credentials, userId, contextToken, `当前工作目录：${cfg.cwd}`);
+        await ack(`当前工作目录：${cfg.cwd}`);
         return;
       }
 
       const abs = path.isAbsolute(arg) ? arg : path.resolve(cfg.cwd, arg);
       if (!fs.existsSync(abs)) {
-        await safeSend(credentials, userId, contextToken, `❌ 目录不存在：${abs}`);
+        await ack(`❌ 目录不存在：${abs}`);
         return;
       }
       const stat = fs.statSync(abs);
       if (!stat.isDirectory()) {
-        await safeSend(credentials, userId, contextToken, `❌ 不是目录：${abs}`);
+        await ack(`❌ 不是目录：${abs}`);
         return;
       }
 
@@ -1332,8 +1311,7 @@ async function main() {
       try {
         persistConfigField('cwd', abs);
       } catch (e) {
-        await safeSend(credentials, userId, contextToken,
-          `⚠️ 内存已切换，但写回配置失败：${(e as Error).message}`);
+        await ack(`⚠️ 内存已切换，但写回配置失败：${(e as Error).message}`);
         return;
       }
 
@@ -1348,7 +1326,7 @@ async function main() {
 
       const parts = [`✅ 工作目录已切换：\n${oldCwd}\n→ ${abs}`, '已写回 bridge.config.json，会话已重置。'];
       if (isBusy) parts.push('正在执行的任务已终止。');
-      await safeSend(credentials, userId, contextToken, parts.join('\n'));
+      await ack(parts.join('\n'));
       return;
     }
 
@@ -1359,19 +1337,19 @@ async function main() {
       killAgent(ctx);
       delete state.sessions[userId];
       saveState(state);
-      await sendMessage(credentials, userId, contextToken, '✅ 已清除会话、终止任务、清空队列和追问。');
+      await ack('✅ 已清除会话、终止任务、清空队列和追问。');
       return;
     }
 
     if (text === '/stop') {
       if (isBusy) {
         killAgent(ctx);
-        await sendMessage(credentials, userId, contextToken,
+        await ack(
           ctx.queue.length > 0
             ? `⏹ 已终止当前任务，队列还有 ${ctx.queue.length} 条将继续处理。`
             : '⏹ 已终止当前任务。');
       } else {
-        await sendMessage(credentials, userId, contextToken, '当前没有正在执行的任务。');
+        await ack('当前没有正在执行的任务。');
       }
       return;
     }
@@ -1384,14 +1362,14 @@ async function main() {
       clearFollowUpFile(userId, cfg.cwd);
       killAgent(ctx);
       const parts = [qLen > 0 && `${qLen} 条排队`, fLen > 0 && `${fLen} 条追问`].filter(Boolean);
-      await sendMessage(credentials, userId, contextToken,
-        `⏹ 已终止当前任务${parts.length ? `并清空 ${parts.join('、')}` : ''}。`);
+      await ack(`⏹ 已终止当前任务${parts.length ? `并清空 ${parts.join('、')}` : ''}。`);
       return;
     }
 
     if (text.startsWith('/send ')) {
       const filePath = text.slice(6).trim();
-      await handleSendFile(userId, contextToken, filePath);
+      await ack('📤 正在发送文件…');
+      await handleSendFile(userId, filePath);
       return;
     }
 
@@ -1399,7 +1377,7 @@ async function main() {
 
     const canReply = !cfg.replyAllowedUserIds.length || cfg.replyAllowedUserIds.includes(userId);
     if (!canReply) {
-      await sendMessage(credentials, userId, contextToken, cfg.replyDeniedMessage);
+      await ack(cfg.replyDeniedMessage);
       return;
     }
 
@@ -1414,60 +1392,80 @@ async function main() {
     if (isBusy) {
       const totalPending = ctx.followUpBuffer.length + ctx.queue.length;
       if (totalPending >= MAX_QUEUE_SIZE) {
-        await sendMessage(credentials, userId, contextToken,
-          `⚠️ 待处理已满 (${MAX_QUEUE_SIZE} 条)。请等当前任务完成，或发 /stop 终止当前任务、/stopall 全部清空。`);
+        await ack(`⚠️ 待处理已满 (${MAX_QUEUE_SIZE} 条)。请等当前任务完成，或发 /stop 终止当前任务、/stopall 全部清空。`);
         return;
       }
 
       if (isExplicitQueue) {
-        /* --- explicit queue: independent task --- */
-        ctx.queue.push({ prompt, contextToken });
+        ctx.queue.push({ prompt });
         console.log(`[bridge] 📋 消息入队 (user=${userId.slice(0, 12)}…, 队列${ctx.queue.length}条)`);
-        await sendMessage(credentials, userId, contextToken,
-          `📋 已作为独立任务排队 (#${ctx.queue.length})，当前任务完成后依次处理。`);
+        await ack(`📋 已作为独立任务排队 (#${ctx.queue.length})，当前任务完成后依次处理。`);
       } else {
-        /* --- default: follow-up → merge into current conversation --- */
-        ctx.followUpBuffer.push({ prompt, contextToken });
+        ctx.followUpBuffer.push({ prompt });
         console.log(`[bridge] 💬 追问入缓冲区 (user=${userId.slice(0, 12)}…, 追问${ctx.followUpBuffer.length}条)`);
         writeFollowUpFile(userId, ctx.followUpBuffer, cfg.cwd);
-        await sendMessage(credentials, userId, contextToken,
-          `💬 已收到追问 (#${ctx.followUpBuffer.length})，已写入 ${FOLLOWUP_FILENAME}，Agent 可在执行中读取。任务完成后也会在同一对话中处理。`);
+        await ack(`💬 已收到追问 (#${ctx.followUpBuffer.length})，已写入 ${FOLLOWUP_FILENAME}，Agent 可在执行中读取。任务完成后也会在同一对话中处理。`);
       }
       return;
     }
 
-    /* --- idle → process --- */
+    /* --- idle → ack immediately, then process via active push --- */
 
-    void drainQueue(userId, prompt, contextToken);
-  }
-
-  /* ---------- main loop ---------- */
-
-  console.log('[bridge] 🔄 进入长轮询循环，等待微信消息...');
-  let pollCount = 0;
-
-  while (true) {
-    try {
-      const resp = await getUpdates(credentials, state.get_updates_buf);
-      if (resp.get_updates_buf) state.get_updates_buf = resp.get_updates_buf;
-      pollCount++;
-
-      const msgCount = resp.msgs?.length ?? 0;
-      if (msgCount > 0) {
-        console.log(`[bridge] 📨 轮询 #${pollCount}: 收到 ${msgCount} 条消息`);
-      } else if (pollCount % 20 === 0) {
-        console.log(`[bridge] … 轮询 #${pollCount} 在线，暂无新消息`);
-      }
-
-      for (const msg of resp.msgs ?? []) {
-        await handleOneMessage(msg);
-      }
-      saveState(state);
-    } catch (e) {
-      console.error('[bridge] getUpdates error:', e);
-      await sleep(3000);
+    if (cfg.sendThinkingHint) {
+      await ack(cfg.thinkingHintText);
     }
+    void drainQueue(userId, prompt);
   }
+
+  /* ---------- wire up events ---------- */
+
+  client.on('authenticated', () => {
+    console.log('[bridge] 🔐 企业微信认证成功，等待消息…');
+  });
+  client.on('connected', () => {
+    console.log('[bridge] 🔗 WebSocket 已连接');
+  });
+  client.on('disconnected', (reason) => {
+    console.warn(`[bridge] 🔌 连接断开: ${reason}`);
+  });
+  client.on('reconnecting', (attempt) => {
+    console.warn(`[bridge] ♻️ 正在重连 (第 ${attempt} 次)…`);
+  });
+  client.on('error', (err) => {
+    console.error('[bridge] ❌ 客户端错误:', err);
+  });
+
+  client.on('message', (frame) => {
+    void handleOneMessage(frame).catch(e => console.error('[bridge] handleOneMessage error:', e));
+  });
+
+  client.on('event.enter_chat', async (frame: WsFrame<EventMessageWith<EnterChatEvent>>) => {
+    const userId = frame.body?.from?.userid;
+    const chattype = frame.body?.chattype;
+    if (chattype && chattype !== 'single') return;
+    if (cfg.allowedUserIds.length && userId && !cfg.allowedUserIds.includes(userId)) return;
+    if (!cfg.welcomeText.trim()) return;
+    try {
+      await client.replyWelcome(frame, { msgtype: 'text', text: { content: cfg.welcomeText } });
+      console.log(`[bridge] 👋 已发送欢迎语 user=${userId?.slice(0, 12) ?? '?'}…`);
+    } catch (e) {
+      console.error('[bridge] replyWelcome error:', e);
+    }
+  });
+
+  console.log('[bridge] 🔄 建立企业微信长连接…');
+  client.connect();
+
+  const shutdown = () => {
+    console.log('\n[bridge] 正在关闭…');
+    try { client.disconnect(); } catch {}
+    process.exit(0);
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
+
+  // 保持进程常驻（事件驱动，无需主动轮询）
+  await new Promise<never>(() => {});
 }
 
 main().catch(e => {

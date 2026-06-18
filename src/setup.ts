@@ -1,125 +1,91 @@
 /**
- * 扫码登录：写入 credentials.json
+ * 交互式录入企业微信智能机器人凭据，写入 credentials.json。
+ *
+ * botId / secret 在企业微信管理后台「智能机器人」配置页获取。
+ * 私有部署可填写自定义长连接地址 wsUrl 与自签证书路径 caPath。
  */
 
-import * as fs from 'node:fs';
-import * as path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import { createRequire } from 'node:module';
-import { fetchQRCode, pollQRStatus } from './ilink.js';
-import type { Credentials } from './types.js';
-import { TEMPLATES_ROOT } from './config.js';
+import * as readline from 'node:readline/promises';
+import { stdin as input, stdout as output } from 'node:process';
+import { saveCredentials, loadCredentials, CREDENTIALS_PATH, type WecomCredentials } from './credentials.js';
+import { createWecomClient } from './wecom.js';
 
-const require = createRequire(import.meta.url);
-const qrcode = require('qrcode-terminal') as { generate: (text: string, opts: { small: boolean }, cb?: () => void) => void };
-
-const CREDENTIALS_PATH = path.join(TEMPLATES_ROOT, 'credentials.json');
-const FIXED_QR_BASE = 'https://ilinkai.weixin.qq.com';
-const MAX_QR_REFRESH = 3;
-const LOGIN_TIMEOUT_MS = 8 * 60 * 1000;
-
-async function setup() {
-  console.log('🔗 微信 ↔ Claude Agent SDK（Cursor 侧能力）桥接');
-  console.log('='.repeat(45));
-  console.log('');
-
-  let refreshCount = 0;
-  const startTime = Date.now();
-
-  while (refreshCount <= MAX_QR_REFRESH) {
-    console.log('📱 正在获取登录二维码...');
-    const qrRes = await fetchQRCode(FIXED_QR_BASE);
-
-    if (!qrRes.qrcode && !qrRes.qrcode_img_content) {
-      console.error('❌ 获取二维码失败');
-      process.exit(1);
-    }
-
-    const qrUrl = qrRes.qrcode_img_content || qrRes.qrcode;
-
-    console.log('');
-    console.log('📷 请用微信扫描以下二维码：');
-    console.log('');
-    qrcode.generate(qrUrl, { small: true });
-    console.log('');
-    console.log(`🔗 或直接在微信中打开: ${qrUrl}`);
-    console.log('');
-    console.log('⏳ 等待扫码确认...');
-
-    let pollApiBase = FIXED_QR_BASE;
-    let lastStatus = '';
-    while (Date.now() - startTime < LOGIN_TIMEOUT_MS) {
-      const statusRes = await pollQRStatus(qrRes.qrcode, pollApiBase);
-
-      if (statusRes.status !== lastStatus) {
-        lastStatus = statusRes.status;
-        switch (statusRes.status) {
-          case 'wait':
-            break;
-          case 'scaned':
-            console.log('📱 已扫码，请在手机上确认...');
-            break;
-          case 'scaned_but_redirect': {
-            const host = statusRes.redirect_host?.trim();
-            if (host) {
-              pollApiBase = host.startsWith('http') ? host : `https://${host}`;
-              console.log(`🔄 IDC 重定向，轮询切换到: ${pollApiBase}`);
-            } else {
-              console.warn('⚠️ scaned_but_redirect 但未返回 redirect_host');
-            }
-            break;
-          }
-          case 'confirmed':
-            console.log('');
-            console.log('✅ 认证成功！');
-            console.log(`   Bot ID: ${statusRes.ilink_bot_id || '(未返回)'}`);
-            console.log(`   User ID: ${statusRes.ilink_user_id || '(未返回)'}`);
-            console.log(`   Base URL: ${statusRes.baseurl || '(使用默认)'}`);
-
-            const credentials: Credentials = {
-              bot_token: statusRes.bot_token!,
-              bot_id: statusRes.ilink_bot_id,
-              base_url: statusRes.baseurl || 'https://ilinkai.weixin.qq.com',
-              user_id: statusRes.ilink_user_id,
-              created_at: new Date().toISOString(),
-            };
-
-            fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(credentials, null, 2), 'utf-8');
-            console.log(`   凭据已保存到: ${CREDENTIALS_PATH}`);
-
-            console.log('');
-            console.log('🚀 复制 bridge.config.example.json 为 bridge.config.json 并编辑 cwd，然后运行 npm start');
-            return;
-
-          case 'expired':
-            console.log('⏰ 二维码已过期');
-            break;
-        }
-      }
-
-      if (statusRes.status === 'expired') {
-        break;
-      }
-
-      await sleep(1000);
-    }
-
-    refreshCount++;
-    if (refreshCount <= MAX_QR_REFRESH) {
-      console.log(`🔄 刷新二维码 (${refreshCount}/${MAX_QR_REFRESH})...`);
-      console.log('');
-    }
-  }
-
-  console.error('❌ 登录超时，请重试');
-  process.exit(1);
+async function ask(rl: readline.Interface, question: string, fallback = ''): Promise<string> {
+  const suffix = fallback ? ` [${fallback}]` : '';
+  const answer = (await rl.question(`${question}${suffix}: `)).trim();
+  return answer || fallback;
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise(resolve => setTimeout(resolve, ms));
+/** 尝试建立连接以验证凭据，超时或断开返回 false */
+function verifyCredentials(cred: WecomCredentials, timeoutMs = 12_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const client = createWecomClient(cred, false);
+    let settled = false;
+    const finish = (ok: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try { client.disconnect(); } catch {}
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    client.on('authenticated', () => finish(true));
+    client.on('error', () => {});
+    client.connect();
+  });
+}
+
+async function setup() {
+  console.log('🔗 企业微信智能机器人 ↔ Cursor Agent 桥接 — 凭据配置');
+  console.log('='.repeat(50));
+  console.log('在企业微信管理后台「智能机器人」页面获取 botId 与 secret。');
+  console.log('');
+
+  let existing: Partial<WecomCredentials> = {};
+  try {
+    existing = loadCredentials();
+    console.log('（检测到已有 credentials.json，直接回车保留原值）\n');
+  } catch {
+    // 无现有凭据，正常流程
+  }
+
+  const rl = readline.createInterface({ input, output });
+  try {
+    const botId = await ask(rl, '机器人 botId', existing.botId ?? '');
+    const secret = await ask(rl, '机器人 secret', existing.secret ?? '');
+    if (!botId || !secret) {
+      console.error('❌ botId 和 secret 不能为空。');
+      process.exit(1);
+    }
+    const wsUrl = await ask(rl, '自定义长连接地址 wsUrl（私有部署填写，公有云直接回车）', existing.wsUrl ?? '');
+    const caPath = wsUrl
+      ? await ask(rl, '自签证书路径 caPath（无则回车）', existing.caPath ?? '')
+      : '';
+
+    const cred: WecomCredentials = {
+      botId,
+      secret,
+      wsUrl: wsUrl || undefined,
+      caPath: caPath || undefined,
+    };
+
+    saveCredentials(cred);
+    console.log(`\n✅ 凭据已保存到: ${CREDENTIALS_PATH}`);
+
+    const doVerify = (await ask(rl, '是否立即测试连接？(y/N)', 'N')).toLowerCase();
+    if (doVerify === 'y' || doVerify === 'yes') {
+      console.log('⏳ 正在尝试连接并认证…');
+      const ok = await verifyCredentials(cred);
+      console.log(ok ? '✅ 连接认证成功！' : '⚠️ 未能在超时内完成认证，请检查 botId/secret 或网络后重试。');
+    }
+
+    console.log('\n🚀 复制 bridge.config.example.json 为 bridge.config.json 并设置 cwd，然后运行 npm start');
+  } finally {
+    rl.close();
+  }
 }
 
 setup().catch(err => {
-  console.error('❌ 启动失败:', err);
+  console.error('❌ 配置失败:', err);
   process.exit(1);
 });
